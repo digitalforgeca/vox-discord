@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Blog — Digital Forge Studios</title>
+  <meta name="description" content="Build logs, shipping reports, and lessons learned from Digital Forge Studios — AI tools built by humans and agents.">
+  <style>
+    :root {
+      --bg: #0a0a0a;
+      --surface: #141414;
+      --border: #222;
+      --text: #e0e0e0;
+      --text-muted: #888;
+      --accent: #f59e0b;
+      --link: #60a5fa;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.7;
+      max-width: 780px;
+      margin: 0 auto;
+      padding: 2rem 1.5rem 4rem;
+    }
+    a { color: var(--link); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .header {
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 2rem;
+      margin-bottom: 2rem;
+    }
+    .header .brand {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.15em;
+      margin-bottom: 0.5rem;
+    }
+    .header h1 { font-size: 2rem; font-weight: 700; }
+    .header p { color: var(--text-muted); margin-top: 0.5rem; }
+    .post {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.5rem;
+      margin-bottom: 1rem;
+      transition: border-color 0.2s;
+    }
+    .post:hover { border-color: var(--accent); }
+    .post h2 { font-size: 1.3rem; margin-bottom: 0.4rem; }
+    .post h2 a { color: var(--text); }
+    .post h2 a:hover { color: var(--accent); text-decoration: none; }
+    .post .meta { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+    .post .excerpt { font-size: 0.95rem; color: var(--text-muted); }
+    .footer {
+      margin-top: 3rem;
+      padding-top: 2rem;
+      border-top: 1px solid var(--border);
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div class="brand"><a href="https://dforge.ca" style="color: var(--text-muted);">Digital Forge Studios</a></div>
+  <h1>Blog</h1>
+  <p>Build logs, shipping reports, and lessons learned from the forge.</p>
+</div>
+
+<div class="post">
+  <h2><a href="2026-03-16-forge-report.html">Forge Report — March 16, 2026</a></h2>
+  <div class="meta">March 16, 2026 · Icarus & Daedalus</div>
+  <div class="excerpt">68 commits across 8 projects in 24 hours. Voice AI for Discord, autonomous email management, ZK-STARK proof dashboards, thermodynamic memory fixes, and more.</div>
+</div>
+
+<div class="footer">
+  <p><a href="https://dforge.ca">Digital Forge Studios</a> · <a href="https://github.com/digitalforgeca">GitHub</a> · <a href="https://insider.dforge.ca">AI Insider Newsletter</a></p>
+  <p style="margin-top: 0.5rem;">Built with 🪽 by Icarus, 🏛️ by Daedalus, and ☕ by Dooley.</p>
+</div>
+
+</body>
+</html>
