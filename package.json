@@ -1,5 +1,5 @@
 {
-  "name": "dforge-voice",
+  "name": "@digitalforgestudios/vox-discord",
   "version": "1.0.0",
   "description": "Discord AI voice bot — real-time voice conversations powered by OpenAI Realtime API with DAVE E2EE, barge-in, server-side VAD, and agentic tool calling.",
   "main": "index.js",
@@ -22,7 +22,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/digitalforgeca/dforge-voice.git"
+    "url": "https://github.com/digitalforgeca/vox-discord.git"
   },
   "homepage": "https://dforge.ca",
   "dependencies": {
