@@ -1,145 +1,130 @@
 #!/usr/bin/env node
-/**
- * dforge-voice — Headless Discord voice worker
- * 
- * Spawned by OpenClaw to join a voice channel and bridge audio
- * to/from the OpenAI Realtime API.
- * 
- * Usage:
- *   node index.js --guild <id> --channel <id>
- *   node index.js --guild <id> --leave
- * 
- * Env vars:
- *   DISCORD_TOKEN          - Bot token
- *   OPENAI_REALTIME_ENDPOINT - WebSocket URL for OpenAI Realtime
- *   OPENAI_REALTIME_API_KEY  - API key
- *   OPENAI_REALTIME_MODEL    - Model name (default: gpt-realtime-1.5)
- *   VOICE_SYSTEM_PROMPT      - System prompt for the AI
- */
+// dforge-voice-js — Discord voice ↔ OpenAI Realtime API bridge
+// Uses @discordjs/voice + @snazzah/davey for DAVE E2EE support
 
-import 'dotenv/config';
-import { Client, GatewayIntentBits } from 'discord.js';
-import {
+require('dotenv').config();
+const { Client, GatewayIntentBits } = require('discord.js');
+const {
   joinVoiceChannel,
-  getVoiceConnection,
-  entersState,
-  VoiceConnectionStatus,
   createAudioPlayer,
   createAudioResource,
-  AudioReceiveStream,
+  AudioPlayerStatus,
   EndBehaviorType,
   StreamType,
-  NoSubscriberBehavior,
-} from '@discordjs/voice';
-import { WebSocket } from 'ws';
-import { Readable } from 'node:stream';
-import { Buffer } from 'node:buffer';
-import prism from 'prism-media';
+  VoiceConnectionStatus,
+  entersState,
+} = require('@discordjs/voice');
+const { OpusEncoder } = require('@discordjs/opus');
+const WebSocket = require('ws');
+const { Transform, PassThrough, Readable } = require('stream');
+const { toolDefinitions, executeTool, setDiscordClient } = require('./tools');
 
-// --- CLI arg parsing ---
-function parseArgs() {
-  const args = process.argv.slice(2);
-  const config = { guildId: null, channelId: null, leave: false };
-  for (let i = 0; i < args.length; i++) {
-    switch (args[i]) {
-      case '--guild': case '-g': config.guildId = args[++i]; break;
-      case '--channel': case '-c': config.channelId = args[++i]; break;
-      case '--leave': case '-l': config.leave = true; break;
-    }
+const TOKEN = process.env.DISCORD_TOKEN;
+const GUILD_ID = process.env.DISCORD_GUILD_ID;
+const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+const REALTIME_ENDPOINT = process.env.OPENAI_REALTIME_ENDPOINT;
+const REALTIME_API_KEY = process.env.OPENAI_REALTIME_API_KEY;
+const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-1.5';
+const SYSTEM_PROMPT = process.env.VOICE_SYSTEM_PROMPT || 'You are a helpful voice assistant.';
+
+// Tuning knobs — all configurable via env vars
+const VOX_VAD_TYPE = process.env.VOX_VAD_TYPE || 'semantic_vad'; // server_vad | semantic_vad | off
+const VOX_THRESHOLD = parseFloat(process.env.VOX_THRESHOLD || '0.6');
+const VOX_PREFIX_PADDING = parseInt(process.env.VOX_PREFIX_PADDING || '300');
+const VOX_SILENCE_DURATION = parseInt(process.env.VOX_SILENCE_DURATION || '500');
+const VOX_EAGERNESS = process.env.VOX_EAGERNESS || 'medium'; // low | medium | high
+const VOX_CREATE_RESPONSE = process.env.VOX_CREATE_RESPONSE !== 'false';
+const VOX_VOICE = process.env.VOX_VOICE || 'alloy';
+const VOX_TEMPERATURE = parseFloat(process.env.VOX_TEMPERATURE || '0.8');
+
+// --- Audio conversion helpers ---
+
+// Discord gives us 48kHz stereo PCM16. OpenAI wants 24kHz mono PCM16.
+function downsampleStereoToMono24k(pcm48kStereo) {
+  // stereo→mono: average L+R. 48k→24k: take every other sample.
+  const samples = pcm48kStereo.length / 2; // 2 bytes per sample
+  const monoSamples = Math.floor(samples / 2); // stereo pairs
+  const out24k = Math.floor(monoSamples / 2); // downsample 2:1
+  const buf = Buffer.alloc(out24k * 2);
+  for (let i = 0; i < out24k; i++) {
+    const srcIdx = i * 2 * 2 * 2; // *2 for downsample, *2 for stereo, *2 for bytes
+    const l = pcm48kStereo.readInt16LE(srcIdx);
+    const r = pcm48kStereo.readInt16LE(srcIdx + 2);
+    buf.writeInt16LE(Math.round((l + r) / 2), i * 2);
   }
-  if (!config.guildId) {
-    console.error('Usage: node index.js --guild <id> --channel <id>');
-    process.exit(1);
-  }
-  if (!config.leave && !config.channelId) {
-    console.error('Error: --channel required unless --leave');
-    process.exit(1);
-  }
-  return config;
+  return buf;
 }
 
-const config = parseArgs();
-const TOKEN = process.env.DISCORD_TOKEN;
-if (!TOKEN) { console.error('DISCORD_TOKEN required'); process.exit(1); }
+// OpenAI sends 24kHz mono PCM16. Discord wants 48kHz stereo PCM16.
+function upsampleMono24kToStereo48k(pcm24kMono) {
+  const inSamples = pcm24kMono.length / 2;
+  const buf = Buffer.alloc(inSamples * 2 * 2 * 2); // *2 upsample, *2 stereo, *2 bytes
+  for (let i = 0; i < inSamples; i++) {
+    const sample = pcm24kMono.readInt16LE(i * 2);
+    const outIdx = i * 8; // 4 output samples * 2 bytes each
+    // duplicate sample for 48kHz, duplicate channels for stereo
+    buf.writeInt16LE(sample, outIdx);
+    buf.writeInt16LE(sample, outIdx + 2);
+    buf.writeInt16LE(sample, outIdx + 4);
+    buf.writeInt16LE(sample, outIdx + 6);
+  }
+  return buf;
+}
 
-const WS_ENDPOINT = process.env.OPENAI_REALTIME_ENDPOINT || '';
-const WS_API_KEY = process.env.OPENAI_REALTIME_API_KEY || '';
-const WS_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-1.5';
-const SYSTEM_PROMPT = process.env.VOICE_SYSTEM_PROMPT || 'You are Icarus, a creative AI operator. Keep responses concise for voice.';
+// --- OpenAI Realtime API connection ---
 
-// --- OpenAI Realtime bridge ---
 class RealtimeBridge {
   constructor() {
     this.ws = null;
-    this.onAudioDelta = null; // callback: (pcm16Buffer) => void
+    this.onAudioDelta = null; // callback(base64Audio)
+    this.onTranscript = null; // callback(text)
+    this.connected = false;
   }
 
   async connect() {
-    const url = `${WS_ENDPOINT}?api-version=2025-04-01-preview&deployment=${WS_MODEL}`;
+    const url = `${REALTIME_ENDPOINT}?api-version=2025-04-01-preview&deployment=${REALTIME_MODEL}`;
     console.log(`[realtime] Connecting to ${url}`);
 
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(url, {
-        headers: { 'api-key': WS_API_KEY },
+        headers: { 'api-key': REALTIME_API_KEY },
       });
 
       this.ws.on('open', () => {
         console.log('[realtime] WebSocket connected');
-        // Configure session
-        this.ws.send(JSON.stringify({
-          type: 'session.update',
-          session: {
-            modalities: ['text', 'audio'],
-            instructions: SYSTEM_PROMPT,
-            voice: 'alloy',
-            input_audio_format: 'pcm16',
-            output_audio_format: 'pcm16',
-            input_audio_transcription: { model: 'whisper-1' },
-            turn_detection: {
-              type: 'server_vad',
-              threshold: 0.5,
-              prefix_padding_ms: 300,
-              silence_duration_ms: 500,
-            },
-          },
-        }));
+        this.connected = true;
         resolve();
       });
 
       this.ws.on('message', (data) => {
-        try {
-          const event = JSON.parse(data.toString());
-          this._handleEvent(event);
-        } catch (e) {
-          console.error('[realtime] Parse error:', e.message);
-        }
+        const event = JSON.parse(data.toString());
+        this.handleEvent(event);
       });
 
       this.ws.on('error', (err) => {
         console.error('[realtime] WebSocket error:', err.message);
-        reject(err);
+        if (!this.connected) reject(err);
       });
 
       this.ws.on('close', (code, reason) => {
         console.log(`[realtime] WebSocket closed: ${code} ${reason}`);
+        this.connected = false;
       });
-
-      setTimeout(() => reject(new Error('WebSocket connection timeout')), 15000);
     });
   }
 
-  _handleEvent(event) {
+  handleEvent(event) {
     switch (event.type) {
       case 'session.created':
         console.log('[realtime] Session created');
+        this.configureSession();
         break;
       case 'session.updated':
         console.log('[realtime] Session configured');
         break;
       case 'response.audio.delta':
-        if (event.delta && this.onAudioDelta) {
-          const pcmBuf = Buffer.from(event.delta, 'base64');
-          this.onAudioDelta(pcmBuf);
+        if (this.onAudioDelta) {
+          this.onAudioDelta(event.delta);
         }
         break;
       case 'response.audio_transcript.delta':
@@ -148,7 +133,22 @@ class RealtimeBridge {
         }
         break;
       case 'response.audio_transcript.done':
-        console.log(''); // newline after transcript
+        console.log('');
+        break;
+      case 'response.done':
+        console.log('[realtime] Response complete');
+        // Check for function calls in the response
+        if (event.response?.output) {
+          for (const item of event.response.output) {
+            if (item.type === 'function_call') {
+              this.handleFunctionCall(item);
+            }
+          }
+        }
+        break;
+      case 'response.function_call_arguments.done':
+        // Also handle via this event for reliability
+        console.log(`[tool] Function call: ${event.name}(${event.arguments})`);
         break;
       case 'input_audio_buffer.speech_started':
         console.log('[vad] Speech started');
@@ -156,227 +156,223 @@ class RealtimeBridge {
       case 'input_audio_buffer.speech_stopped':
         console.log('[vad] Speech stopped');
         break;
-      case 'response.done':
-        console.log('[realtime] Response complete');
-        break;
       case 'error':
-        console.error('[realtime] API error:', event.error?.message || event);
-        break;
-      default:
-        // console.log('[realtime] Event:', event.type);
+        console.error('[realtime] Error:', event.error?.message || JSON.stringify(event.error));
         break;
     }
   }
 
-  /** Send PCM16 24kHz mono audio to OpenAI */
-  sendAudio(pcm16Buffer) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({
-        type: 'input_audio_buffer.append',
-        audio: pcm16Buffer.toString('base64'),
-      }));
+  async handleFunctionCall(item) {
+    const { name, arguments: argsStr, call_id } = item;
+    console.log(`[tool] Executing function call: ${name} (call_id: ${call_id})`);
+
+    let args = {};
+    try {
+      args = JSON.parse(argsStr);
+    } catch (e) {
+      console.error('[tool] Failed to parse arguments:', argsStr);
+      args = {};
     }
+
+    // Execute the tool
+    const result = await executeTool(name, args);
+    console.log(`[tool] Result (${result.length} chars): ${result.substring(0, 200)}...`);
+
+    // Send the result back to the model
+    this.ws.send(JSON.stringify({
+      type: 'conversation.item.create',
+      item: {
+        type: 'function_call_output',
+        call_id: call_id,
+        output: result,
+      },
+    }));
+
+    // Trigger the model to generate a response with the tool result
+    this.ws.send(JSON.stringify({
+      type: 'response.create',
+    }));
+  }
+
+  configureSession() {
+    // Build turn detection config based on VAD type
+    let turn_detection;
+    if (VOX_VAD_TYPE === 'off') {
+      turn_detection = null;
+    } else if (VOX_VAD_TYPE === 'semantic_vad') {
+      turn_detection = {
+        type: 'semantic_vad',
+        eagerness: VOX_EAGERNESS,
+        create_response: VOX_CREATE_RESPONSE,
+      };
+      console.log(`[config] semantic_vad — eagerness: ${VOX_EAGERNESS}`);
+    } else {
+      turn_detection = {
+        type: 'server_vad',
+        threshold: VOX_THRESHOLD,
+        prefix_padding_ms: VOX_PREFIX_PADDING,
+        silence_duration_ms: VOX_SILENCE_DURATION,
+        create_response: VOX_CREATE_RESPONSE,
+      };
+      console.log(`[config] server_vad — threshold: ${VOX_THRESHOLD}, silence: ${VOX_SILENCE_DURATION}ms`);
+    }
+
+    const sessionConfig = {
+      modalities: ['text', 'audio'],
+      instructions: SYSTEM_PROMPT,
+      voice: VOX_VOICE,
+      temperature: VOX_TEMPERATURE,
+      input_audio_format: 'pcm16',
+      output_audio_format: 'pcm16',
+      input_audio_transcription: { model: 'whisper-1' },
+      turn_detection,
+      tools: toolDefinitions,
+      tool_choice: 'auto',
+    };
+
+    console.log(`[config] tools: ${toolDefinitions.map(t => t.name).join(', ')}`);
+
+    console.log(`[config] voice: ${VOX_VOICE}, temp: ${VOX_TEMPERATURE}`);
+    this.ws.send(JSON.stringify({ type: 'session.update', session: sessionConfig }));
+  }
+
+  // Live reconfigure — call this to push new settings mid-session
+  updateSession(patch) {
+    if (!this.connected) return;
+    console.log('[config] Live update:', JSON.stringify(patch));
+    this.ws.send(JSON.stringify({ type: 'session.update', session: patch }));
+  }
+
+  sendAudio(base64Pcm16) {
+    if (!this.connected) return;
+    this.ws.send(JSON.stringify({
+      type: 'input_audio_buffer.append',
+      audio: base64Pcm16,
+    }));
   }
 
   close() {
-    this.ws?.close();
+    if (this.ws) this.ws.close();
   }
 }
 
-// --- Audio format conversions ---
+// --- Playback stream ---
 
-/**
- * Downsample 48kHz stereo i16 PCM → 24kHz mono i16 PCM
- * Input: Buffer of interleaved L/R i16 samples at 48kHz
- * Output: Buffer of mono i16 samples at 24kHz
- */
-function downsample48kStereoTo24kMono(buf) {
-  // 48kHz stereo = 4 bytes per frame (2 bytes L + 2 bytes R)
-  // Take every other frame → 24kHz, average L+R → mono
-  const frameCount = Math.floor(buf.length / 4);
-  const out = Buffer.alloc(Math.floor(frameCount / 2) * 2);
-  let outIdx = 0;
-  for (let i = 0; i < frameCount; i += 2) {
-    const offset = i * 4;
-    const l = buf.readInt16LE(offset);
-    const r = buf.readInt16LE(offset + 2);
-    const mono = Math.round((l + r) / 2);
-    out.writeInt16LE(Math.max(-32768, Math.min(32767, mono)), outIdx);
-    outIdx += 2;
+class PlaybackStream extends Readable {
+  constructor() {
+    super();
+    this.chunks = [];
+    this.waiting = null;
   }
-  return out.subarray(0, outIdx);
-}
 
-/**
- * Upsample 24kHz mono i16 PCM → 48kHz stereo i16 PCM
- * Input: Buffer of mono i16 samples at 24kHz
- * Output: Buffer of interleaved L/R i16 samples at 48kHz
- */
-function upsample24kMonoTo48kStereo(buf) {
-  const sampleCount = Math.floor(buf.length / 2);
-  // Each sample becomes 2 frames (upsample) × 2 channels (stereo) = 4 output samples
-  const out = Buffer.alloc(sampleCount * 2 * 4);
-  let outIdx = 0;
-  for (let i = 0; i < sampleCount; i++) {
-    const sample = buf.readInt16LE(i * 2);
-    // Write twice (24k→48k) with L=R (mono→stereo)
-    for (let j = 0; j < 2; j++) {
-      out.writeInt16LE(sample, outIdx); outIdx += 2; // L
-      out.writeInt16LE(sample, outIdx); outIdx += 2; // R
+  pushAudio(buf) {
+    if (this.waiting) {
+      const cb = this.waiting;
+      this.waiting = null;
+      this.push(buf);
+    } else {
+      this.chunks.push(buf);
     }
   }
-  return out;
+
+  _read(size) {
+    if (this.chunks.length > 0) {
+      // Push as many chunks as we can
+      while (this.chunks.length > 0) {
+        const chunk = this.chunks.shift();
+        if (!this.push(chunk)) break;
+      }
+    } else {
+      // No data — push silence frame (20ms of 48kHz stereo = 3840 samples = 7680 bytes)
+      const silence = Buffer.alloc(7680, 0);
+      this.push(silence);
+    }
+  }
 }
 
 // --- Main ---
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-  ],
-});
 
-client.once('ready', async () => {
-  console.log(`[discord] ${client.user.tag} voice worker ready`);
-
-  if (config.leave) {
-    const conn = getVoiceConnection(config.guildId);
-    if (conn) {
-      conn.destroy();
-      console.log('[discord] Left voice channel');
-    } else {
-      console.log('[discord] Not in a voice channel');
-    }
-    setTimeout(() => process.exit(0), 1000);
-    return;
-  }
-
-  // Join the voice channel
-  console.log(`[discord] Joining guild=${config.guildId} channel=${config.channelId}`);
-  const connection = joinVoiceChannel({
-    channelId: config.channelId,
-    guildId: config.guildId,
-    adapterCreator: client.guilds.cache.get(config.guildId)?.voiceAdapterCreator,
-    selfDeaf: false,
-    selfMute: false,
+async function main() {
+  const client = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildVoiceStates,
+    ],
   });
 
-  try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-    console.log('[discord] Voice connection ready (DAVE encrypted)');
-  } catch (err) {
-    console.error('[discord] Failed to connect to voice:', err.message);
-    connection.destroy();
-    process.exit(1);
-  }
+  client.once('ready', async () => {
+    console.log(`[discord] ${client.user.tag} is ready`);
+    setDiscordClient(client);
 
-  // Set up the OpenAI bridge
-  const bridge = new RealtimeBridge();
-  try {
+    // Join voice channel
+    const connection = joinVoiceChannel({
+      channelId: CHANNEL_ID,
+      guildId: GUILD_ID,
+      adapterCreator: client.guilds.cache.get(GUILD_ID).voiceAdapterCreator,
+      selfDeaf: false,
+    });
+
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+      console.log('[discord] Voice connection ready');
+    } catch (err) {
+      console.error('[discord] Failed to join voice:', err.message);
+      process.exit(1);
+    }
+
+    // Connect to OpenAI Realtime
+    const bridge = new RealtimeBridge();
     await bridge.connect();
-  } catch (err) {
-    console.error('[bridge] Failed to connect to OpenAI:', err.message);
-    connection.destroy();
-    process.exit(1);
-  }
 
-  // --- Playback: AI audio → Discord ---
-  const player = createAudioPlayer({
-    behaviors: { noSubscriber: NoSubscriberBehavior.Play },
-  });
-  connection.subscribe(player);
-
-  // Buffer AI audio chunks and stream them to the player
-  let playbackQueue = [];
-  let isPlaying = false;
-
-  function playNextChunk() {
-    if (playbackQueue.length === 0) {
-      isPlaying = false;
-      return;
-    }
-    isPlaying = true;
-
-    // Merge queued chunks into one buffer
-    const merged = Buffer.concat(playbackQueue.splice(0));
-    // Upsample 24kHz mono → 48kHz stereo for Discord
-    const pcm48kStereo = upsample24kMonoTo48kStereo(merged);
-
-    const readable = Readable.from([pcm48kStereo]);
-    const resource = createAudioResource(readable, {
+    // Set up playback
+    const playback = new PlaybackStream();
+    const player = createAudioPlayer();
+    const resource = createAudioResource(playback, {
       inputType: StreamType.Raw,
     });
-
     player.play(resource);
-  }
+    connection.subscribe(player);
 
-  // When AI produces audio, queue it
-  bridge.onAudioDelta = (pcm16Buf24kMono) => {
-    playbackQueue.push(pcm16Buf24kMono);
-    // Batch: play every ~200ms of audio (4800 samples at 24kHz = 200ms)
-    const totalBytes = playbackQueue.reduce((a, b) => a + b.length, 0);
-    if (!isPlaying && totalBytes >= 9600) { // 4800 samples × 2 bytes
-      playNextChunk();
-    }
-  };
+    // OpenAI audio → Discord playback
+    bridge.onAudioDelta = (base64Audio) => {
+      const pcm24k = Buffer.from(base64Audio, 'base64');
+      const pcm48kStereo = upsampleMono24kToStereo48k(pcm24k);
+      playback.pushAudio(pcm48kStereo);
+    };
 
-  player.on('stateChange', (oldState, newState) => {
-    if (newState.status === 'idle' && playbackQueue.length > 0) {
-      playNextChunk();
-    }
-  });
+    // Discord audio → OpenAI
+    connection.receiver.speaking.on('start', (userId) => {
+      console.log(`[receive] User ${userId} started speaking`);
 
-  // --- Receive: Discord user audio → OpenAI ---
-  connection.receiver.speaking.on('start', (userId) => {
-    // Don't listen to ourselves
-    if (userId === client.user.id) return;
+      const opusStream = connection.receiver.subscribe(userId, {
+        end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 },
+      });
 
-    console.log(`[receive] User ${userId} started speaking`);
+      const decoder = new OpusEncoder(48000, 2);
 
-    const audioStream = connection.receiver.subscribe(userId, {
-      end: {
-        behavior: EndBehaviorType.AfterSilence,
-        duration: 300,
-      },
+      opusStream.on('data', (packet) => {
+        try {
+          const pcm48kStereo = decoder.decode(packet);
+          const pcm24kMono = downsampleStereoToMono24k(pcm48kStereo);
+          const base64 = pcm24kMono.toString('base64');
+          bridge.sendAudio(base64);
+        } catch (e) {
+          // Opus decode errors are normal for first few packets
+        }
+      });
+
+      opusStream.on('end', () => {
+        console.log(`[receive] User ${userId} stopped speaking`);
+      });
     });
 
-    // Opus stream → PCM via prism
-    const opusDecoder = new prism.opus.Decoder({
-      frameSize: 960,
-      channels: 2,
-      rate: 48000,
-    });
-
-    audioStream.pipe(opusDecoder).on('data', (pcm48kStereo) => {
-      // Downsample to 24kHz mono for OpenAI
-      const pcm24kMono = downsample48kStereoTo24kMono(pcm48kStereo);
-      if (pcm24kMono.length > 0) {
-        bridge.sendAudio(pcm24kMono);
-      }
-    });
-
-    opusDecoder.on('error', (err) => {
-      console.error('[decode] Opus error:', err.message);
-    });
+    console.log('[bridge] 🎤 Voice bridge active — listening and speaking');
   });
 
-  // Keep alive signal
-  console.log('[voice] 🎤 Bridge active — listening and speaking');
+  client.login(TOKEN);
+}
 
-  // Graceful shutdown
-  process.on('SIGTERM', () => {
-    console.log('[voice] SIGTERM received, disconnecting...');
-    bridge.close();
-    connection.destroy();
-    setTimeout(() => process.exit(0), 1000);
-  });
-
-  process.on('SIGINT', () => {
-    console.log('[voice] SIGINT received, disconnecting...');
-    bridge.close();
-    connection.destroy();
-    setTimeout(() => process.exit(0), 1000);
-  });
+main().catch((err) => {
+  console.error('Fatal:', err);
+  process.exit(1);
 });
-
-client.login(TOKEN);

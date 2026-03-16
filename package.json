@@ -1,19 +1,36 @@
 {
   "name": "dforge-voice",
-  "version": "0.1.0",
-  "description": "Discord voice bot — headless worker spawned by OpenClaw, bridges to OpenAI Realtime API",
-  "type": "module",
+  "version": "1.0.0",
+  "description": "Discord AI voice bot — real-time voice conversations powered by OpenAI Realtime API with DAVE E2EE, barge-in, server-side VAD, and agentic tool calling.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "keywords": [
+    "discord",
+    "voice",
+    "ai",
+    "openai",
+    "realtime",
+    "dave",
+    "e2ee",
+    "voice-bot",
+    "gpt",
+    "speech"
+  ],
+  "author": "Digital Forge Studios <hello@dforge.ca> (https://dforge.ca)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/digitalforgeca/dforge-voice.git"
+  },
+  "homepage": "https://dforge.ca",
   "dependencies": {
+    "@discordjs/opus": "^0.10.0",
     "@discordjs/voice": "^0.19.1",
     "@snazzah/davey": "^0.1.10",
     "discord.js": "^14.25.1",
     "dotenv": "^17.3.1",
-    "opusscript": "^0.0.8",
-    "prism-media": "^1.3.5",
     "sodium-native": "^5.1.0",
     "ws": "^8.19.0"
   }
